@@ -19,8 +19,65 @@ from xml.sax.saxutils import escape
 import streamlit as st
 
 
+# IFC class → list of valid instance subclasses.
+# Auto-expand so e.g. IfcWindow rules also pass IfcWindowStandardCase.
+SUBCLASS_MAP: dict[str, list[str]] = {
+    "IfcWindow":    ["IfcWindow", "IfcWindowStandardCase"],
+    "IfcDoor":      ["IfcDoor", "IfcDoorStandardCase"],
+    "IfcWall":      ["IfcWall", "IfcWallStandardCase", "IfcWallElementedCase"],
+    "IfcSlab":      ["IfcSlab", "IfcSlabStandardCase", "IfcSlabElementedCase"],
+    "IfcBeam":      ["IfcBeam", "IfcBeamStandardCase"],
+    "IfcColumn":    ["IfcColumn", "IfcColumnStandardCase"],
+    "IfcMember":    ["IfcMember", "IfcMemberStandardCase"],
+    "IfcPlate":     ["IfcPlate", "IfcPlateStandardCase"],
+    "IfcStair":     ["IfcStair"],
+    "IfcStairFlight": ["IfcStairFlight"],
+    "IfcRamp":      ["IfcRamp"],
+    "IfcRampFlight": ["IfcRampFlight"],
+    "IfcRoof":      ["IfcRoof"],
+    "IfcCovering":  ["IfcCovering"],
+    "IfcCurtainWall": ["IfcCurtainWall"],
+    "IfcRailing":   ["IfcRailing"],
+    "IfcFooting":   ["IfcFooting"],
+    "IfcPile":      ["IfcPile"],
+    "IfcOpeningElement": ["IfcOpeningElement"],
+    "IfcBuildingElementProxy": ["IfcBuildingElementProxy"],
+    "IfcChimney":   ["IfcChimney"],
+    "IfcShadingDevice": ["IfcShadingDevice"],
+}
+
+# Universe of instance product classes that the rules apply to.
+# Type objects (IfcWindowType, IfcDoorStyle, etc.) are NOT in this list,
+# so they're excluded from applicability automatically.
+INSTANCE_UNIVERSE: list[str] = sorted({c for sub in SUBCLASS_MAP.values() for c in sub})
+
+
+def expand_subclasses(correct_class: str) -> list[str]:
+    """Return correct_class plus its known instance subclasses (auto-expanded)."""
+    return SUBCLASS_MAP.get(correct_class, [correct_class])
+
+
+def _entity_enum_xml(classes: list[str], indent: int) -> str:
+    """Build an entity facet's <name> as an enumeration of classes (uppercased)."""
+    pad = " " * indent
+    enums = "\n".join(
+        f'{pad}              <xs:enumeration value="{escape(c.upper())}"/>'
+        for c in classes
+    )
+    return (
+        f"{pad}<name>\n"
+        f"{pad}            <xs:restriction base=\"xs:string\">\n"
+        f"{enums}\n"
+        f"{pad}            </xs:restriction>\n"
+        f"{pad}          </name>"
+    )
+
+
 SPEC_TEMPLATE = """    <specification name="{name}" ifcVersion="IFC2X3 IFC4">
       <applicability minOccurs="0" maxOccurs="unbounded">
+        <entity>
+          {applicability_name}
+        </entity>
         <property>
           <propertySet><simpleValue>JM</simpleValue></propertySet>
           <baseName><simpleValue>TypeID</simpleValue></baseName>
@@ -33,7 +90,7 @@ SPEC_TEMPLATE = """    <specification name="{name}" ifcVersion="IFC2X3 IFC4">
       </applicability>
       <requirements>
         <entity instructions="{instructions}">
-          <name><simpleValue>{ifc_class_upper}</simpleValue></name>
+          {requirement_name}
         </entity>
       </requirements>
     </specification>"""
@@ -93,17 +150,18 @@ def parse_rules(text: str) -> tuple[list[tuple[str, str, str]], list[str]]:
 
 
 def build_spec(pattern: str, correct_class: str, note: str) -> str:
-    cls_upper = correct_class.upper()
-    if not cls_upper.startswith("IFC"):
-        cls_upper = "IFC" + cls_upper
+    valid_classes = expand_subclasses(correct_class)
     name = f"TypeID '{pattern}' must be {correct_class}"
+    if len(valid_classes) > 1:
+        name += f" (or subclass)"
     if note:
-        name += f" ({note})"
-    instructions = note or f"Element should be exported as {correct_class}, not the current class."
+        name += f" — {note}"
+    instructions = note or f"Element should be exported as {correct_class} (or a valid subclass)."
     return SPEC_TEMPLATE.format(
         name=escape(name, {'"': "&quot;"}),
         pattern=escape(pattern, {'"': "&quot;"}),
-        ifc_class_upper=cls_upper,
+        applicability_name=_entity_enum_xml(INSTANCE_UNIVERSE, indent=8),
+        requirement_name=_entity_enum_xml(valid_classes, indent=8),
         instructions=escape(instructions, {'"': "&quot;"}),
     )
 
@@ -171,8 +229,23 @@ for w in warnings:
     st.warning(w)
 
 st.subheader(f"Regler ({len(rules)})")
+unknown_classes = [c for _, c, _ in rules if c not in SUBCLASS_MAP]
+if unknown_classes:
+    st.warning(
+        f"Okända klasser (ingen subklass-expansion sker): {', '.join(sorted(set(unknown_classes)))}. "
+        f"De används som-de-är. Lägg till i SUBCLASS_MAP om du vill auto-expandera."
+    )
+
 st.dataframe(
-    [{"Pattern": p, "Correct class": c, "Note": n} for p, c, n in rules],
+    [
+        {
+            "Pattern": p,
+            "Correct class": c,
+            "Expanded valid classes": ", ".join(expand_subclasses(c)),
+            "Note": n,
+        }
+        for p, c, n in rules
+    ],
     use_container_width=True, hide_index=True,
 )
 
