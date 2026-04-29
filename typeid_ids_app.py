@@ -56,10 +56,20 @@ IDS_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+def _sniff_dialect(text: str) -> csv.Dialect:
+    """Detect , vs ; separator (Swedish Excel uses ;)."""
+    sample = text[:2048]
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",;\t")
+    except csv.Error:
+        return csv.excel  # fall back to comma
+
+
 def parse_rules(text: str) -> tuple[list[tuple[str, str, str]], list[str]]:
     """Return (rules, warnings). Rules = (pattern, class, note)."""
     rules, warnings = [], []
-    reader = csv.DictReader(io.StringIO(text))
+    dialect = _sniff_dialect(text)
+    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
     if reader.fieldnames is None:
         return [], ["CSV is empty."]
     cols = {c.strip(): c for c in reader.fieldnames}
