@@ -59,7 +59,11 @@ def subclasses_of(parent: str) -> list[str]:
 
 
 def _build_instance_universe() -> list[str]:
-    """All concrete instance classes the rules apply to (used in applicability)."""
+    """All concrete instance classes the rules apply to.
+
+    Used to enumerate 'wrong classes' — for each rule, every class in this
+    universe that is NOT the correct class generates one prohibited spec.
+    """
     universe: set[str] = set()
     for p in TRACKED_PARENTS:
         universe.update(subclasses_of(p))
@@ -67,7 +71,7 @@ def _build_instance_universe() -> list[str]:
 
 
 def expand_subclasses(correct_class: str) -> list[str]:
-    """Return correct_class + its schema-known subtypes (for the requirement enum)."""
+    """Return correct_class + its schema-known subtypes (treated as 'allowed')."""
     return subclasses_of(correct_class)
 
 
@@ -75,8 +79,30 @@ def expand_subclasses(correct_class: str) -> list[str]:
 INSTANCE_UNIVERSE: list[str] = _build_instance_universe()
 
 
+SPEC_TEMPLATE = """    <specification name="{name}" ifcVersion="IFC2X3 IFC4">
+      <applicability minOccurs="0" maxOccurs="unbounded">
+        <entity><name><simpleValue>{wrong_class_upper}</simpleValue></name></entity>
+        <property>
+          <propertySet><simpleValue>JM</simpleValue></propertySet>
+          <baseName><simpleValue>TypeID</simpleValue></baseName>
+          <value>
+            <xs:restriction base="xs:string">
+              <xs:pattern value="{pattern}"/>
+            </xs:restriction>
+          </value>
+        </property>
+      </applicability>
+      <requirements>
+        <property cardinality="prohibited" instructions="{instructions}">
+          <propertySet><simpleValue>JM</simpleValue></propertySet>
+          <baseName><simpleValue>TypeID</simpleValue></baseName>
+        </property>
+      </requirements>
+    </specification>"""
+
+
 def _entity_enum_xml(classes: list[str], indent: int) -> str:
-    """Build an entity facet's <name> as an enumeration of classes (uppercased)."""
+    """(Kept for backward compat — unused after refactor)"""
     pad = " " * indent
     enums = "\n".join(
         f'{pad}              <xs:enumeration value="{escape(c.upper())}"/>'
@@ -89,29 +115,6 @@ def _entity_enum_xml(classes: list[str], indent: int) -> str:
         f"{pad}            </xs:restriction>\n"
         f"{pad}          </name>"
     )
-
-
-SPEC_TEMPLATE = """    <specification name="{name}" ifcVersion="IFC2X3 IFC4">
-      <applicability minOccurs="0" maxOccurs="unbounded">
-        <entity>
-          {applicability_name}
-        </entity>
-        <property>
-          <propertySet><simpleValue>JM</simpleValue></propertySet>
-          <baseName><simpleValue>TypeID</simpleValue></baseName>
-          <value>
-            <xs:restriction base="xs:string">
-              <xs:pattern value="{pattern}"/>
-            </xs:restriction>
-          </value>
-        </property>
-      </applicability>
-      <requirements>
-        <entity instructions="{instructions}">
-          {requirement_name}
-        </entity>
-      </requirements>
-    </specification>"""
 
 IDS_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <ids xmlns="http://standards.buildingsmart.org/IDS"
@@ -168,20 +171,28 @@ def parse_rules(text: str) -> tuple[list[tuple[str, str, str]], list[str]]:
 
 
 def build_spec(pattern: str, correct_class: str, note: str) -> str:
-    valid_classes = expand_subclasses(correct_class)
-    name = f"TypeID '{pattern}' must be {correct_class}"
-    if len(valid_classes) > 1:
-        name += f" (or subclass)"
-    if note:
-        name += f" — {note}"
-    instructions = note or f"Element should be exported as {correct_class} (or a valid subclass)."
-    return SPEC_TEMPLATE.format(
-        name=escape(name, {'"': "&quot;"}),
-        pattern=escape(pattern, {'"': "&quot;"}),
-        applicability_name=_entity_enum_xml(INSTANCE_UNIVERSE, indent=8),
-        requirement_name=_entity_enum_xml(valid_classes, indent=8),
-        instructions=escape(instructions, {'"': "&quot;"}),
-    )
+    """Generate one prohibited-spec per wrong IFC class for this TypeID rule.
+
+    Concept: 'BLK.* TypeID on IfcWindow → prohibited' is a single spec.
+    For each rule we emit len(INSTANCE_UNIVERSE) - len(allowed) specs,
+    one per class that should NOT carry this TypeID.
+    """
+    allowed = set(expand_subclasses(correct_class))
+    wrong_classes = [c for c in INSTANCE_UNIVERSE if c not in allowed]
+    note_part = f" — {note}" if note else ""
+    instr_base = note or f"This TypeID should be on {correct_class} (or subclass), not on this class."
+
+    specs = []
+    for wrong in wrong_classes:
+        name = f"TypeID '{pattern}' on {wrong} (should be {correct_class}){note_part}"
+        instructions = f"{instr_base} Found on {wrong}."
+        specs.append(SPEC_TEMPLATE.format(
+            name=escape(name, {'"': "&quot;"}),
+            pattern=escape(pattern, {'"': "&quot;"}),
+            wrong_class_upper=wrong.upper(),
+            instructions=escape(instructions, {'"': "&quot;"}),
+        ))
+    return "\n".join(specs)
 
 
 def build_ids(rules: list[tuple[str, str, str]]) -> str:
@@ -205,7 +216,10 @@ def validate_with_ifctester(ids_text: str) -> str | None:
 # --- UI ---
 st.set_page_config(page_title="TypeID → IDS", page_icon="🛠️", layout="centered")
 st.title("🛠️ TypeID-klass kontroll → IDS")
-st.caption("Generera en IDS-fil som flaggar element där TypeID inte matchar förväntad IFC-klass.")
+st.caption(
+    "Genererar en IDS-fil som flaggar element där TypeID hamnat på fel IFC-klass. "
+    "Varje regel → en spec per fel-klass (prohibited). Fungerar med ifctester och Solibri."
+)
 
 with st.expander("📋 CSV-format"):
     st.code(
@@ -277,7 +291,7 @@ if err:
         st.code(ids_text, language="xml")
     st.stop()
 
-st.success("✅ IDS validerad av ifctester.")
+st.success(f"✅ IDS validerad av ifctester ({len(rules)} regler → {ids_text.count('<specification ')} specs).")
 
 filename = f"typeid_class_{date.today().strftime('%Y%m%d')}.ids"
 st.download_button(
