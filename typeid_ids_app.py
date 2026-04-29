@@ -19,42 +19,60 @@ from xml.sax.saxutils import escape
 import streamlit as st
 
 
-# IFC class → list of valid instance subclasses.
-# Auto-expand so e.g. IfcWindow rules also pass IfcWindowStandardCase.
-SUBCLASS_MAP: dict[str, list[str]] = {
-    "IfcWindow":    ["IfcWindow", "IfcWindowStandardCase"],
-    "IfcDoor":      ["IfcDoor", "IfcDoorStandardCase"],
-    "IfcWall":      ["IfcWall", "IfcWallStandardCase", "IfcWallElementedCase"],
-    "IfcSlab":      ["IfcSlab", "IfcSlabStandardCase", "IfcSlabElementedCase"],
-    "IfcBeam":      ["IfcBeam", "IfcBeamStandardCase"],
-    "IfcColumn":    ["IfcColumn", "IfcColumnStandardCase"],
-    "IfcMember":    ["IfcMember", "IfcMemberStandardCase"],
-    "IfcPlate":     ["IfcPlate", "IfcPlateStandardCase"],
-    "IfcStair":     ["IfcStair"],
-    "IfcStairFlight": ["IfcStairFlight"],
-    "IfcRamp":      ["IfcRamp"],
-    "IfcRampFlight": ["IfcRampFlight"],
-    "IfcRoof":      ["IfcRoof"],
-    "IfcCovering":  ["IfcCovering"],
-    "IfcCurtainWall": ["IfcCurtainWall"],
-    "IfcRailing":   ["IfcRailing"],
-    "IfcFooting":   ["IfcFooting"],
-    "IfcPile":      ["IfcPile"],
-    "IfcOpeningElement": ["IfcOpeningElement"],
-    "IfcBuildingElementProxy": ["IfcBuildingElementProxy"],
-    "IfcChimney":   ["IfcChimney"],
-    "IfcShadingDevice": ["IfcShadingDevice"],
-}
+# Parent classes we want rules to apply to. The instance universe (used in
+# applicability) is derived from these. Subclasses are auto-discovered from
+# the IFC schema, unioned across IFC2X3 + IFC4.
+TRACKED_PARENTS: list[str] = [
+    "IfcWall", "IfcDoor", "IfcWindow", "IfcSlab", "IfcBeam", "IfcColumn",
+    "IfcMember", "IfcPlate", "IfcStair", "IfcStairFlight", "IfcRamp",
+    "IfcRampFlight", "IfcRoof", "IfcCovering", "IfcCurtainWall",
+    "IfcRailing", "IfcFooting", "IfcPile", "IfcOpeningElement",
+    "IfcBuildingElementProxy", "IfcChimney", "IfcShadingDevice",
+]
 
-# Universe of instance product classes that the rules apply to.
-# Type objects (IfcWindowType, IfcDoorStyle, etc.) are NOT in this list,
-# so they're excluded from applicability automatically.
-INSTANCE_UNIVERSE: list[str] = sorted({c for sub in SUBCLASS_MAP.values() for c in sub})
+_SCHEMAS = ("IFC2X3", "IFC4")
+
+
+def _all_subtypes(decl) -> list[str]:
+    """Recursive walk of an entity declaration's subtype tree (parent included)."""
+    out = [decl.name()]
+    for sub in decl.subtypes():
+        out.extend(_all_subtypes(sub))
+    return out
+
+
+def subclasses_of(parent: str) -> list[str]:
+    """Return parent + all schema-known subtypes, unioned across IFC2X3 and IFC4.
+
+    Falls back to [parent] if the class doesn't exist in either schema.
+    """
+    import ifcopenshell
+    found: set[str] = set()
+    for v in _SCHEMAS:
+        try:
+            schema = ifcopenshell.schema_by_name(v)
+            decl = schema.declaration_by_name(parent)
+            found.update(_all_subtypes(decl))
+        except Exception:
+            continue
+    return sorted(found) if found else [parent]
+
+
+def _build_instance_universe() -> list[str]:
+    """All concrete instance classes the rules apply to (used in applicability)."""
+    universe: set[str] = set()
+    for p in TRACKED_PARENTS:
+        universe.update(subclasses_of(p))
+    return sorted(universe)
 
 
 def expand_subclasses(correct_class: str) -> list[str]:
-    """Return correct_class plus its known instance subclasses (auto-expanded)."""
-    return SUBCLASS_MAP.get(correct_class, [correct_class])
+    """Return correct_class + its schema-known subtypes (for the requirement enum)."""
+    return subclasses_of(correct_class)
+
+
+# Build once at import; cheap (just schema lookups).
+INSTANCE_UNIVERSE: list[str] = _build_instance_universe()
 
 
 def _entity_enum_xml(classes: list[str], indent: int) -> str:
@@ -229,11 +247,12 @@ for w in warnings:
     st.warning(w)
 
 st.subheader(f"Regler ({len(rules)})")
-unknown_classes = [c for _, c, _ in rules if c not in SUBCLASS_MAP]
+unknown_classes = [c for _, c, _ in rules if len(subclasses_of(c)) == 1 and subclasses_of(c)[0] == c]
 if unknown_classes:
     st.warning(
-        f"Okända klasser (ingen subklass-expansion sker): {', '.join(sorted(set(unknown_classes)))}. "
-        f"De används som-de-är. Lägg till i SUBCLASS_MAP om du vill auto-expandera."
+        f"Klasser utan schema-kända subklasser (ingen expansion): "
+        f"{', '.join(sorted(set(unknown_classes)))}. "
+        f"Används som-de-är. Verifiera att namnet är korrekt."
     )
 
 st.dataframe(
