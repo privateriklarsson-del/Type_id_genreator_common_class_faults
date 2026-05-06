@@ -2,12 +2,15 @@
 Mini Streamlit: CSV → IDS for TypeID-vs-IFC-class checks.
 
 CSV format:
-    TypeIDPattern,CorrectClass,Note
-    BLK.*,IfcDoor,Balkongdörr
-    BFx.*,IfcWindow,Blindfönster
+    TypeIDPattern,CorrectClass,WrongClasses,Note
+    BLK.*,IfcDoor,IfcWindow|IfcWindowStandardCase,Balkongdörr
+    BFx.*,IfcWindow,IfcDoor|IfcDoorStandardCase|IfcWall,Blindfönster
 
 Patterns use XSD regex (full-match, auto-anchored).
 Use BLK.* for "starts with BLK". No ^ or $.
+
+WrongClasses: pipe-separated list of IFC classes to check against.
+List exactly the classes you want flagged — no subclass expansion.
 """
 from __future__ import annotations
 
@@ -17,66 +20,6 @@ from datetime import date
 from xml.sax.saxutils import escape
 
 import streamlit as st
-
-
-# Parent classes we want rules to apply to. The instance universe (used in
-# applicability) is derived from these. Subclasses are auto-discovered from
-# the IFC schema, unioned across IFC2X3 + IFC4.
-TRACKED_PARENTS: list[str] = [
-    "IfcWall", "IfcDoor", "IfcWindow", "IfcSlab", "IfcBeam", "IfcColumn",
-    "IfcMember", "IfcPlate", "IfcStair", "IfcStairFlight", "IfcRamp",
-    "IfcRampFlight", "IfcRoof", "IfcCovering", "IfcCurtainWall",
-    "IfcRailing", "IfcFooting", "IfcPile", "IfcOpeningElement",
-    "IfcBuildingElementProxy", "IfcChimney", "IfcShadingDevice",
-]
-
-_SCHEMAS = ("IFC2X3", "IFC4")
-
-
-def _all_subtypes(decl) -> list[str]:
-    """Recursive walk of an entity declaration's subtype tree (parent included)."""
-    out = [decl.name()]
-    for sub in decl.subtypes():
-        out.extend(_all_subtypes(sub))
-    return out
-
-
-def subclasses_of(parent: str) -> list[str]:
-    """Return parent + all schema-known subtypes, unioned across IFC2X3 and IFC4.
-
-    Falls back to [parent] if the class doesn't exist in either schema.
-    """
-    import ifcopenshell
-    found: set[str] = set()
-    for v in _SCHEMAS:
-        try:
-            schema = ifcopenshell.schema_by_name(v)
-            decl = schema.declaration_by_name(parent)
-            found.update(_all_subtypes(decl))
-        except Exception:
-            continue
-    return sorted(found) if found else [parent]
-
-
-def _build_instance_universe() -> list[str]:
-    """All concrete instance classes the rules apply to.
-
-    Used to enumerate 'wrong classes' — for each rule, every class in this
-    universe that is NOT the correct class generates one prohibited spec.
-    """
-    universe: set[str] = set()
-    for p in TRACKED_PARENTS:
-        universe.update(subclasses_of(p))
-    return sorted(universe)
-
-
-def expand_subclasses(correct_class: str) -> list[str]:
-    """Return correct_class + its schema-known subtypes (treated as 'allowed')."""
-    return subclasses_of(correct_class)
-
-
-# Build once at import; cheap (just schema lookups).
-INSTANCE_UNIVERSE: list[str] = _build_instance_universe()
 
 
 SPEC_TEMPLATE = """    <specification name="{name}" ifcVersion="IFC2X3 IFC4">
@@ -99,22 +42,6 @@ SPEC_TEMPLATE = """    <specification name="{name}" ifcVersion="IFC2X3 IFC4">
         </property>
       </requirements>
     </specification>"""
-
-
-def _entity_enum_xml(classes: list[str], indent: int) -> str:
-    """(Kept for backward compat — unused after refactor)"""
-    pad = " " * indent
-    enums = "\n".join(
-        f'{pad}              <xs:enumeration value="{escape(c.upper())}"/>'
-        for c in classes
-    )
-    return (
-        f"{pad}<name>\n"
-        f"{pad}            <xs:restriction base=\"xs:string\">\n"
-        f"{enums}\n"
-        f"{pad}            </xs:restriction>\n"
-        f"{pad}          </name>"
-    )
 
 IDS_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <ids xmlns="http://standards.buildingsmart.org/IDS"
@@ -143,44 +70,63 @@ def _sniff_dialect(text: str) -> csv.Dialect:
         return csv.excel  # fall back to comma
 
 
-def parse_rules(text: str) -> tuple[list[tuple[str, str, str]], list[str]]:
-    """Return (rules, warnings). Rules = (pattern, class, note)."""
+def parse_rules(text: str) -> tuple[list[tuple[str, str, list[str], str]], list[str]]:
+    """Return (rules, warnings). Rules = (pattern, correct_class, wrong_classes, note)."""
     rules, warnings = [], []
     dialect = _sniff_dialect(text)
     reader = csv.DictReader(io.StringIO(text), dialect=dialect)
     if reader.fieldnames is None:
         return [], ["CSV is empty."]
     cols = {c.strip(): c for c in reader.fieldnames}
-    if "TypeIDPattern" not in cols or "CorrectClass" not in cols:
-        return [], [f"Missing required columns. Found: {list(cols)}. Need: TypeIDPattern, CorrectClass."]
+
+    required = ["TypeIDPattern", "CorrectClass", "WrongClasses"]
+    missing = [c for c in required if c not in cols]
+    if missing:
+        return [], [f"Missing required columns: {missing}. Found: {list(cols)}."]
 
     for i, row in enumerate(reader, start=2):  # row 1 = header
         pattern = (row.get(cols["TypeIDPattern"]) or "").strip()
-        correct = (row.get(cols.get("CorrectClass", "")) or "").strip()
+        correct = (row.get(cols["CorrectClass"]) or "").strip()
+        wrong_raw = (row.get(cols["WrongClasses"]) or "").strip()
         note = (row.get(cols.get("Note", "Note")) or "").strip() if "Note" in cols else ""
+
         if not pattern or not correct:
             continue
+        if not wrong_raw:
+            warnings.append(f"Row {i}: skipped — WrongClasses is empty.")
+            continue
+
+        wrong_classes = [w.strip() for w in wrong_raw.split("|") if w.strip()]
+        if not wrong_classes:
+            warnings.append(f"Row {i}: skipped — WrongClasses parsed to empty list.")
+            continue
+
         if pattern.startswith("^"):
             warnings.append(f"Row {i}: stripped leading '^' from '{pattern}' (XSD patterns are auto-anchored).")
             pattern = pattern[1:]
         if pattern.endswith("$"):
             warnings.append(f"Row {i}: stripped trailing '$' from '{pattern}'.")
             pattern = pattern[:-1]
-        rules.append((pattern, correct, note))
+
+        # Sanity: warn if the correct class ended up in wrong list (probably a mistake)
+        overlap = [w for w in wrong_classes if w == correct]
+        if overlap:
+            warnings.append(
+                f"Row {i}: '{correct}' is in both CorrectClass and WrongClasses — removed from wrong list."
+            )
+            wrong_classes = [w for w in wrong_classes if w != correct]
+            if not wrong_classes:
+                warnings.append(f"Row {i}: skipped — no wrong classes left after dedup.")
+                continue
+
+        rules.append((pattern, correct, wrong_classes, note))
     return rules, warnings
 
 
-def build_spec(pattern: str, correct_class: str, note: str) -> str:
-    """Generate one prohibited-spec per wrong IFC class for this TypeID rule.
-
-    Concept: 'BLK.* TypeID on IfcWindow → prohibited' is a single spec.
-    For each rule we emit len(INSTANCE_UNIVERSE) - len(allowed) specs,
-    one per class that should NOT carry this TypeID.
-    """
-    allowed = set(expand_subclasses(correct_class))
-    wrong_classes = [c for c in INSTANCE_UNIVERSE if c not in allowed]
+def build_spec(pattern: str, correct_class: str, wrong_classes: list[str], note: str) -> str:
+    """Generate one prohibited-spec per user-specified wrong IFC class."""
     note_part = f" — {note}" if note else ""
-    instr_base = note or f"This TypeID should be on {correct_class} (or subclass), not on this class."
+    instr_base = note or f"This TypeID should be on {correct_class}, not on this class."
 
     specs = []
     for wrong in wrong_classes:
@@ -195,8 +141,8 @@ def build_spec(pattern: str, correct_class: str, note: str) -> str:
     return "\n".join(specs)
 
 
-def build_ids(rules: list[tuple[str, str, str]]) -> str:
-    specs = "\n".join(build_spec(p, c, n) for p, c, n in rules)
+def build_ids(rules: list[tuple[str, str, list[str], str]]) -> str:
+    specs = "\n".join(build_spec(p, c, w, n) for p, c, w, n in rules)
     return IDS_TEMPLATE.format(today=date.today().isoformat(), specs=specs)
 
 
@@ -223,14 +169,17 @@ st.caption(
 
 with st.expander("📋 CSV-format"):
     st.code(
-        "TypeIDPattern,CorrectClass,Note\n"
-        "BLK.*,IfcDoor,Balkongdörr\n"
-        "BFx.*,IfcWindow,Blindfönster\n",
+        "TypeIDPattern,CorrectClass,WrongClasses,Note\n"
+        "BLK.*,IfcDoor,IfcWindow|IfcWindowStandardCase,Balkongdörr\n"
+        "BFx.*,IfcWindow,IfcDoor|IfcDoorStandardCase|IfcWall,Blindfönster\n",
         language="csv",
     )
     st.markdown(
         "- **TypeIDPattern**: XSD regex. `BLK.*` = börjar med BLK. Inga `^` eller `$`.\n"
-        "- **CorrectClass**: t.ex. `IfcDoor`, `IfcWindow`.\n"
+        "- **CorrectClass**: t.ex. `IfcDoor` (vad det _ska_ vara).\n"
+        "- **WrongClasses**: pipe-separerad lista av klasser att flagga, t.ex. "
+        "`IfcWindow|IfcWindowStandardCase`. Inga subklasser auto-expanderas — "
+        "lista exakt vad du vill kontrollera.\n"
         "- **Note**: valfri kommentar (visas i IDS-rapporten)."
     )
 
@@ -239,7 +188,11 @@ uploaded = st.file_uploader("Ladda upp regel-CSV", type=["csv"])
 # Sample download
 st.download_button(
     "⬇️ Ladda ner exempel-CSV",
-    data="TypeIDPattern,CorrectClass,Note\nBLK.*,IfcDoor,Balkongdörr\nBFx.*,IfcWindow,Blindfönster\n",
+    data=(
+        "TypeIDPattern,CorrectClass,WrongClasses,Note\n"
+        "BLK.*,IfcDoor,IfcWindow|IfcWindowStandardCase,Balkongdörr\n"
+        "BFx.*,IfcWindow,IfcDoor|IfcDoorStandardCase|IfcWall,Blindfönster\n"
+    ),
     file_name="typeid_class_rules_example.csv",
     mime="text/csv",
 )
@@ -261,23 +214,15 @@ for w in warnings:
     st.warning(w)
 
 st.subheader(f"Regler ({len(rules)})")
-unknown_classes = [c for _, c, _ in rules if len(subclasses_of(c)) == 1 and subclasses_of(c)[0] == c]
-if unknown_classes:
-    st.warning(
-        f"Klasser utan schema-kända subklasser (ingen expansion): "
-        f"{', '.join(sorted(set(unknown_classes)))}. "
-        f"Används som-de-är. Verifiera att namnet är korrekt."
-    )
-
 st.dataframe(
     [
         {
             "Pattern": p,
             "Correct class": c,
-            "Expanded valid classes": ", ".join(expand_subclasses(c)),
+            "Wrong classes (flagged)": ", ".join(w),
             "Note": n,
         }
-        for p, c, n in rules
+        for p, c, w, n in rules
     ],
     use_container_width=True, hide_index=True,
 )
